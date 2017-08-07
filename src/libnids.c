@@ -219,6 +219,30 @@ static void call_ip_frag_procs(void *data,bpf_u_int32 caplen)
 #define LLC_OFFSET_TO_TYPE_FIELD 6
 #define ETHERTYPE_IP 0x0800
 
+static int nids_check_qinq(struct pcap_pkthdr *hdr, u_char *data)
+{
+    u_int i, e;
+    for (i = 1; ; ++i) {
+        e = 14 + (i << 2);
+        if (hdr->caplen < e) {
+            return 0;
+        }
+        if (data[e-2] == 0x81 && data[e-1] == 0) {
+            /* 802.1Q VLAN */
+            continue;
+        } else if (data[e-2] == 0x88 && data[e-1] == 0xa8) {
+            /* 802.1AD Double Tag */
+            continue;
+        } else if (data[e-2] == 0x08 && data[e-1] == 0) {
+            /* Regular ethernet */
+            return e;
+        } else {
+            /* Non-IP frame */
+            return 0;
+        }
+    }
+}
+
 void nids_pcap_handler(u_char * par, struct pcap_pkthdr *hdr, u_char * data)
 {
     u_char *data_aligned;
@@ -244,18 +268,24 @@ void nids_pcap_handler(u_char * par, struct pcap_pkthdr *hdr, u_char * data)
     (void)par; /* warnings... */
     switch (linktype) {
     case DLT_EN10MB:
-	if (hdr->caplen < 14)
+	if (hdr->caplen < 14) {
 	    return;
+    }
 	/* Only handle IP packets and 802.1Q VLAN tagged packets below. */
-	if (data[12] == 8 && data[13] == 0) {
+	if (data[12] == 0x08 && data[13] == 0) {
 	    /* Regular ethernet */
 	    nids_linkoffset = 14;
-	} else if (data[12] == 0x81 && data[13] == 0) {
-	    /* Skip 802.1Q VLAN and priority information */
-	    nids_linkoffset = 18;
-	} else
+	} else if ((data[12] == 0x81 && data[13] == 0) || (data[12] == 0x88 && data[13] == 0xa8)) {
+        /* 802.1Q VLAN or 802.1AD Q-in-Q */
+	    nids_linkoffset = nids_check_qinq(hdr, data);
+        if (nids_linkoffset == 0) {
+            /* non-ip frame */
+            return;
+        }
+	} else {
 	    /* non-ip frame */
 	    return;
+    }
 	break;
 #ifdef DLT_PRISM_HEADER
 #ifndef DLT_IEEE802_11
@@ -311,6 +341,7 @@ void nids_pcap_handler(u_char * par, struct pcap_pkthdr *hdr, u_char * data)
 #endif
     default:;
     }
+
     if (hdr->caplen < nids_linkoffset)
 	return;
 
@@ -368,30 +399,32 @@ static void gen_ip_frag_proc(u_char * data, int len)
     void (*glibc_syslog_h_workaround)(int, int, struct ip *, void*)=
         nids_params.syslog;
 
-    if (!nids_params.ip_filter(iph, len))
-	return;
+    if (!nids_params.ip_filter(iph, len)) {
+        return;
+    }
 
     if (len < (int)sizeof(struct ip) || iph->ip_hl < 5 || iph->ip_v != 4 ||
-	ip_fast_csum((unsigned char *) iph, iph->ip_hl) != 0 ||
-	len < ntohs(iph->ip_len) || ntohs(iph->ip_len) < iph->ip_hl << 2) {
-	glibc_syslog_h_workaround(NIDS_WARN_IP, NIDS_WARN_IP_HDR, iph, 0);
-	return;
+            ip_fast_csum((unsigned char *) iph, iph->ip_hl) != 0 ||
+            len < ntohs(iph->ip_len) || ntohs(iph->ip_len) < iph->ip_hl << 2) {
+        glibc_syslog_h_workaround(NIDS_WARN_IP, NIDS_WARN_IP_HDR, iph, 0);
+        return;
     }
     if (iph->ip_hl > 5 && ip_options_compile((unsigned char *)data)) {
-	glibc_syslog_h_workaround(NIDS_WARN_IP, NIDS_WARN_IP_SRR, iph, 0);
-	return;
+        glibc_syslog_h_workaround(NIDS_WARN_IP, NIDS_WARN_IP_SRR, iph, 0);
+        return;
     }
     switch (ip_defrag_stub((struct ip *) data, &iph)) {
     case IPF_ISF:
-	return;
+        return;
     case IPF_NOTF:
-	need_free = 0;
-	iph = (struct ip *) data;
-	break;
+        need_free = 0;
+        iph = (struct ip *) data;
+        break;
     case IPF_NEW:
-	need_free = 1;
-	break;
-    default:;
+        need_free = 1;
+        break;
+    default:
+        break;
     }
     skblen = ntohs(iph->ip_len) + 16;
     if (!need_free)
